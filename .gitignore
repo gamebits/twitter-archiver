@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local test archives (may contain personal data)
+*.zip
