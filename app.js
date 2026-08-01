@@ -329,142 +329,193 @@ body {
 }`;
 }
 
+// Update the on-page progress output and log to the console.
+function setProgress(message) {
+  console.log(message);
+  const $output = document.getElementById('output');
+  $output.innerHTML += `<p>${message}</p>`;
+  document.querySelectorAll('body')[0].scrollIntoView(false);
+}
+
+// Open an input Twitter archive zip for reading.
+async function openInputArchive(file) {
+  if (typeof unzipit === 'undefined') {
+    throw new Error('unzipit failed to load. Make sure unzipit.min.js is in the same folder as index.html.');
+  }
+  const arrayBuffer = await file.arrayBuffer();
+  const { entries } = await unzipit.unzip(arrayBuffer);
+  const filenames = Object.keys(entries);
+  return {
+    fileCount: filenames.length,
+    readText(filename) {
+      const entry = entries[filename];
+      if (!entry) {
+        throw new TypeError(`Missing file in archive: ${filename}`);
+      }
+      return entry.text();
+    },
+    readBlob(filename) {
+      const entry = entries[filename];
+      if (!entry) {
+        throw new TypeError(`Missing file in archive: ${filename}`);
+      }
+      return entry.blob();
+    },
+    listMediaFilenames() {
+      return filenames.filter((name) => name.startsWith('data/tweets_media/') && !name.endsWith('/'));
+    },
+    close() {
+      return Promise.resolve();
+    },
+  };
+}
+
+// Collect output files and build archive.zip with fflate (pure JS; works in Safari).
+function createOutputArchive() {
+  if (typeof fflate === 'undefined') {
+    throw new Error('fflate failed to load. Make sure fflate.min.js is in the same folder as index.html.');
+  }
+  const files = {};
+  return {
+    addText(path, text) {
+      files[path] = new TextEncoder().encode(text);
+    },
+    async addBlob(path, blob) {
+      files[path] = new Uint8Array(await blob.arrayBuffer());
+    },
+    finish() {
+      return new Promise((resolve, reject) => {
+        fflate.zip(files, { level: 0 }, (err, data) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve(new Blob([data], { type: 'application/zip' }));
+          }
+        });
+      });
+    },
+  };
+}
+
+// Process an uploaded Twitter archive zip and download the generated static site.
+async function handleFile(f) {
+  const $output = document.getElementById('output');
+  setProgress('Reading zip file into memory...');
+  const archive = await openInputArchive(f);
+  try {
+    setProgress(`Found ${archive.fileCount} files in archive. Loading manifest...`);
+    const manifestContent = await archive.readText('data/manifest.js');
+    eval(manifestContent);
+    const tweetFiles = window.__THAR_CONFIG.dataTypes.tweets.files;
+    const userName = window.__THAR_CONFIG.userInfo.userName;
+    const displayName = window.__THAR_CONFIG.userInfo.displayName;
+    const accountId = window.__THAR_CONFIG.userInfo.accountId;
+    const accountInfo = {
+      userName, displayName, accountId,
+    };
+    for (const file of tweetFiles) {
+      setProgress(`Loading ${file.fileName}...`);
+      const tweetContent = await archive.readText(file.fileName);
+      eval(tweetContent);
+    }
+    setProgress('Building output archive...');
+    const output = createOutputArchive();
+    output.addText('styles.css', makeStyles());
+    tweets = [];
+    setProgress('Filtering and flattening tweets...');
+    for (const wrapper of Object.keys(window.YTD.tweets)) {
+      for (const data of window.YTD.tweets[wrapper]) {
+        const tweet = data.tweet;
+        if (!tweet.in_reply_to_user_id_str || tweet.in_reply_to_user_id_str === accountId.toString()) {
+          tweets.push(tweet);
+        }
+      }
+    }
+    setProgress('Setting up threading metadata...');
+    for (const tweet of tweets) {
+      if (tweet.in_reply_to_user_id_str === accountId.toString()) {
+        const parentIndex = tweets.findIndex(item => item.id_str === tweet.in_reply_to_status_id_str);
+        if (parentIndex >= 0) {
+          if (!tweets[parentIndex].children) {
+            tweets[parentIndex].children = [tweet.id_str];
+          } else {
+            tweets[parentIndex].children.push(tweet.id_str);
+          }
+        }
+      }
+    }
+    setProgress('Making all the HTML pages...');
+    for (const tweet of tweets) {
+      const id = tweet.id_str || tweet.id;
+      if (directoriesDisabled) {
+        output.addText(`${userName}/status/${id}.html`, makePage(tweet, accountInfo));
+      } else {
+        output.addText(`${userName}/status/${id}/index.html`, makePage(tweet, accountInfo));
+      }
+    }
+    setProgress('Setting up the search documents...');
+    const searchDocuments = tweets
+      .filter(tweet => tweet.full_text.substr(0, 4) !== 'RT @')
+      .map(tweet => ({
+        created_at: tweet.created_at,
+        id_str: tweet.id_str,
+        full_text: tweet.full_text,
+        favorite_count: tweet.favorite_count,
+        retweet_count: tweet.retweet_count,
+      }));
+    output.addText('searchDocuments.js', 'const searchDocuments = ' + JSON.stringify(searchDocuments));
+    output.addText('app.js', makeOutputAppJs(accountInfo));
+    output.addText('index.html', makeOutputIndexHtml(accountInfo));
+    setProgress('Dropping in all your media files...');
+    for (const mediaPath of archive.listMediaFilenames()) {
+      const relativePath = mediaPath.slice('data/tweets_media/'.length);
+      const matchId = relativePath.match(/^(.+?)-/);
+      const tweetId = matchId ? matchId[1] : '';
+      if (!tweetId) {
+        continue;
+      }
+      const tweet = tweets.find(item => item.id_str === tweetId);
+      if (tweet
+          && tweet.extended_entities
+          && tweet.extended_entities.media
+          && tweet.extended_entities.media.length > 0) {
+        if (!tweet.extended_entities.media[0].source_user_id_str || tweet.extended_entities.media[0].source_user_id_str === accountInfo.accountId.toString()) {
+          const mediaBlob = await archive.readBlob(mediaPath);
+          await output.addBlob(`${userName}/tweets_media/${relativePath}`, mediaBlob);
+        }
+      }
+    }
+    setProgress('Finalizing archive.zip...');
+    const blob = await output.finish();
+    saveAs(blob, 'archive.zip');
+    console.log('DONE');
+    document.getElementById('loading').hidden = true;
+    $output.innerHTML += `<p><strong>DONE!!!</strong> Check your browser downloads for "archive.zip", and then unzip it on a web server somewhere. <em>It is likely to be much smaller than your original zip because it won't have media for stuff you retweeted.</em> I highly recommend that you upload the zip file itself to the server and unzip it once it's there. That way your file transfer will go much faster than if you try to unzip it localy and then upload 100k files. If you are using something like cPanel on your host, I believe most versions of that let you unzip a file you've uploaded somewhere in the user interface.</p>`;
+    document.querySelectorAll('body')[0].scrollIntoView(false);
+  } finally {
+    await archive.close();
+  }
+}
+
 function parseZip() {
   console.log('starting...');
   const $output = document.getElementById('output');
   document.getElementById('loading').hidden = false;
   $output.innerHTML += `<p>Starting...</p>`;
   document.querySelectorAll('body')[0].scrollIntoView(false);
-  const dateBefore = new Date();
-  function handleFile(f) {
-    JSZip.loadAsync(f)
-      .then(zip => {
-        const dateAfter = new Date();
-        zip.file('data/manifest.js').async("string").then(function(content) {
-          eval(content);
-          const tweetFiles = window.__THAR_CONFIG.dataTypes.tweets.files;
-          const userName = window.__THAR_CONFIG.userInfo.userName;
-          const displayName = window.__THAR_CONFIG.userInfo.displayName;
-          const accountId = window.__THAR_CONFIG.userInfo.accountId;
-          const accountInfo = {
-            userName, displayName, accountId,
-          };
-          // set up for grabbing all the tweet data
-          let promises = [];
-          for (const file of tweetFiles) {
-            promises.push(new Promise((resolve, reject) => {
-              zip.file(file.fileName).async('string').then(tweetContent => {
-                eval(tweetContent);
-                resolve(`done ${file.fileName}`);
-              });
-            }));
-          }
-          // grab all the tweet data
-          Promise.all(promises).then(values => {
-            // when done...
-            const siteZip = new JSZip();
-						siteZip.file(`styles.css`, makeStyles());
-            // flatten the arrays of tweets into one big array
-            tweets = [];
-            $output.innerHTML += `<p>Filtering and flattening tweets...</p>`;
-            for (const wrapper of Object.keys(window.YTD.tweets)) {
-              for (const data of window.YTD.tweets[wrapper]) {
-                const tweet = data.tweet;
-                // only save tweets that are original tweets or replies to myself
-                if (!tweet.in_reply_to_user_id_str || tweet.in_reply_to_user_id_str === accountId.toString()) {
-                  tweets.push(tweet);
-                }
-              }
-            }
-            $output.innerHTML += `<p>Setting up threading metadata...</p>`;
-            // iterate once through every tweet to set up the children array
-            // so if something I wrote has two direct replies that I wrote, it will have an array size 2 with each ID of the two child replies
-            for (const tweet of tweets) {
-              if (tweet.in_reply_to_user_id_str === accountId.toString()) {
-                // find the original tweet in the data structure
-                const parentIndex = tweets.findIndex(item => item.id_str === tweet.in_reply_to_status_id_str);
-                if (parentIndex >= 0) { 
-                  if (!tweets[parentIndex].children) {
-                    tweets[parentIndex].children = [tweet.id_str];
-                  } else {
-                    tweets[parentIndex].children.push(tweet.id_str);
-                  }
-                }
-              }
-            }
-            $output.innerHTML += `<p>Making all the HTML pages...</p>`;
-            document.querySelectorAll('body')[0].scrollIntoView(false);
-            for (const tweet of tweets) {
-                let id = tweet.id_str || tweet.id;
-                if (directoriesDisabled) {
-                  siteZip.file(`${userName}/status/${id}.html`, makePage(tweet, accountInfo));
-                } else {
-                  siteZip.file(`${userName}/status/${id}/index.html`, makePage(tweet, accountInfo));
-                }
-            }
-            $output.innerHTML += `<p>Setting up the search documents...</p>`;
-            document.querySelectorAll('body')[0].scrollIntoView(false);
-            const searchDocuments = tweets
-              .filter(tweet => tweet.full_text.substr(0,4) !== 'RT @')
-              .map(tweet => {
-                  return {
-                    created_at: tweet.created_at,
-                    id_str: tweet.id_str,
-                    full_text: tweet.full_text,
-                    favorite_count: tweet.favorite_count,
-                    retweet_count: tweet.retweet_count,
-                  };
-                });
-            siteZip.file(`searchDocuments.js`, 'const searchDocuments = ' + JSON.stringify(searchDocuments));
-            siteZip.file(`app.js`, makeOutputAppJs(accountInfo));
-            siteZip.file(`index.html`, makeOutputIndexHtml(accountInfo));
-            $output.innerHTML += `<p>Dropping in all your media files...</p>`;
-            document.querySelectorAll('body')[0].scrollIntoView(false);
-            zip.folder('data/tweets_media').forEach((relativePath, file) => {
-              // only include this in the archive if it's original material we posted (not RTs)
-              // grab the tweet id from the filename
-              const matchId = relativePath.match(/^(.+?)-/);
-              const tweetId = matchId ? matchId[1] : '';
-              if (tweetId) {
-                const tweet = tweets.find(tweet => tweet.id_str === tweetId);
-                if (tweet
-                    && tweet.extended_entities
-                    && tweet.extended_entities.media
-                    && tweet.extended_entities.media.length > 0) {
-                  // if this tweet has media and it's original material (not from a retweet), add it to the zip
-                  if (!tweet.extended_entities.media[0].source_user_id_str || tweet.extended_entities.media[0].source_user_id_str === accountInfo.accountId.toString()) {
-                    siteZip.file(`${userName}/tweets_media/${relativePath}`, file.async('blob'));
-                  }
-                }
-              }
-            });
-            siteZip.generateAsync({ type: 'blob' }).then(blob => {
-              saveAs(blob, 'archive.zip');
-              console.log('DONE');
-              document.getElementById('loading').hidden = true;
-              $output.innerHTML += `<p><strong>DONE!!!</strong> Check your browser downloads for "archive.zip", and then unzip it on a web server somewhere. <em>It is likely to be much smaller than your original zip because it won't have media for stuff you retweeted.</em> I highly recommend that you upload the zip file itself to the server and unzip it once it's there. That way your file transfer will go much faster than if you try to unzip it localy and then upload 100k files. If you are using something like cPanel on your host, I believe most versions of that let you unzip a file you've uploaded somewhere in the user interface.</p>`;
-              document.querySelectorAll('body')[0].scrollIntoView(false);
-            }, err => { console.log('ERR', err);
-              $output.innerHTML += `<p><strong>ERROR!</strong> ${err.toString()}</p>`;
-              document.querySelectorAll('body')[0].scrollIntoView(false);
-            });
-          });
-        });
-      }).catch(error => {
-        const $output = document.getElementById('output');
-        document.getElementById('loading').hidden = true;
-        $output.innerHTML = `<p class="error">Error! ${error.toString()}</p>`;
-        if (error.toString().includes('TypeError')) {
-          $output.innerHTML += `<p>I am guessing that your zip file is missing some files. It is also possible that you unzipped and re-zipped your file and the data is in an extra subdirectory. Check out the "Known problems" section above. You'll need the "data" directory to be in the zip root, not living under some other directory.</p>`;
-        }
-        if (error.toString().includes('Corrupted')) {
-          $output.innerHTML += `<p>I am guessing that your archive is too big! If it's more than 2GB you're likely to see this error. If you look above at the "Known problems" section, you'll see a potential solution. Sorry it is a bit of a pain in the ass.</p>`;
-        }
-      });
+  function showError(error) {
+    document.getElementById('loading').hidden = true;
+    $output.innerHTML = `<p class="error">Error! ${error.toString()}</p>`;
+    if (error.toString().includes('TypeError') || error.toString().includes('Missing file in archive')) {
+      $output.innerHTML += `<p>I am guessing that your zip file is missing some files. It is also possible that you unzipped and re-zipped your file and the data is in an extra subdirectory. Check out the "Known problems" section above. You'll need the "data" directory to be in the zip root, not living under some other directory.</p>`;
+    }
+    if (error.toString().includes('too large') || error.toString().includes('memory')) {
+      $output.innerHTML += `<p>I am guessing that your archive is too big! If it's more than 2GB you're likely to see this error. If you look above at the "Known problems" section, you'll see a potential solution. Sorry it is a bit of a pain in the ass.</p>`;
+    }
   }
-  let files = document.getElementById('file').files;
+  const files = document.getElementById('file').files;
   for (const file of files) {
-    handleFile(file);
+    handleFile(file).catch(showError);
   }
 }
 
