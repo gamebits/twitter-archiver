@@ -186,12 +186,16 @@ body {
     border: 2px solid black;
     border-radius: 16px;
 }
-.tweet img,
-.tweet video {
-  display: block;
-  max-width: 100%;
-  height: auto;
+.tweet img {
+  max-height: 100%;
   vertical-align: bottom;
+  width: 100%;
+  object-fit: cover;
+}
+.tweet video {
+  max-height: 100%;
+  vertical-align: bottom;
+  width: 100%;
 }
 .tweet ul {
   display: flex;
@@ -202,14 +206,9 @@ body {
   margin-bottom: 0px;
 }
 .tweet li {
-  flex: 1 1 100%;
-  min-width: 0;
-}
-.tweet li:only-child {
-  flex-basis: 100%;
-}
-.tweet li:not(:only-child) {
-  flex-basis: calc(50% - 4px);
+  height: 20vh;
+  width: 20vh;
+  flex-grow: 1;
 }
 .tweet .display_name {
   margin-bottom: 0;
@@ -246,8 +245,10 @@ body {
   background-color: white;
 }
 @media screen and (max-width: 599px) {
-  .tweet li:not(:only-child) {
-    flex-basis: 100%;
+  .tweet li {
+    height: 15vh;
+    width: 15vh;
+    flex-grow: 1;
   }
 }
 @media(prefers-color-scheme: dark) {
